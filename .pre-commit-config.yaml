@@ -1,0 +1,40 @@
+#
+# install both hook types:
+#
+#     pre-commit install --hook-type pre-commit --hook-type pre-push
+#
+
+repos:
+  - repo: local
+    hooks:
+      - id: no-hardcoded-paths
+        name: no hardcoded paths
+        entry: bash -c 'top=$(git rev-parse --show-toplevel); rel=${top#$HOME/}; ! grep -nEH "$HOME|$rel" "$@"' --
+        language: system
+        types: [text]
+        stages: [pre-commit]
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt
+        language: system
+        types: [rust]
+        stages: [pre-commit]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        stages: [pre-push]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
+        language: system
+        types_or: [rust, toml]
+        files: (\.rs|assets/default-settings\.toml)$
+        stages: [pre-push]
+        pass_filenames: false

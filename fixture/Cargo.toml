@@ -1,0 +1,22 @@
+[package]
+name = "cargo-gc-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Realistic-but-small multi-dep app used by cargo-grime-cremator's integration tests."
+
+[[bin]]
+name = "fixture"
+path = "src/main.rs"
+
+# Picked to exercise the same on-disk artifact patterns as a large bevy-style
+# app (proc-macros, build scripts, hyphenated crate names, transitive deps)
+# while keeping a clean build under ~1 minute and < ~1 GB of artifacts.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

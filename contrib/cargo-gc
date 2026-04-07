@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Mark-and-sweep GC for target/debug/deps and target/debug/incremental.
+#
+# Discovery phase uses `cargo build` as baseline, then probes additional
+# targets (test, clippy) with try-and-abort: if the command finishes
+# quickly (all fresh), its hashes are merged into the live set. If it
+# starts compiling (stale), it's killed immediately and those artifacts
+# are left to be swept.
+#
+# This preserves test/clippy artifacts when they're already built,
+# avoiding 20-minute recompiles, without forcing a full --all-targets
+# build that would fill the drive.
+set -euo pipefail
+
+DRY_RUN=false
+MAX_AGE_HOURS=168  # 1 week
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --max-age)
+      MAX_AGE_HOURS="$2"; shift 2 ;;
+    --max-age=*)
+      MAX_AGE_HOURS="${1#*=}"; shift ;;
+    *)
+      echo "unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+target_dir=$(cargo metadata --format-version=1 --no-deps \
+    | jq -r '.target_directory')
+deps_dir="$target_dir/debug/deps"
+
+if [[ ! -d "$deps_dir" ]]
+then echo "No deps dir: $deps_dir" >&2; exit 1
+fi
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+declare -A live_hashes
+declare -A live_crates
+
+# Extract hashes from cargo json output, merging into live_hashes/live_crates.
+# Sets _merge_count with the number of hashes found.
+# MUST be called directly (not in a subshell) or associative array writes are lost.
+# $1 = path to json file
+merge_hashes_from_json() {
+  local json_file="$1"
+  _merge_count=0
+
+  while IFS= read -r path; do
+    local base
+    base=$(basename "$path")
+    if [[ "$base" =~ -([a-f0-9]{16})(\.|$) ]]; then
+      live_hashes["${BASH_REMATCH[1]}"]=1
+      ((_merge_count++)) || true
+    fi
+  done < <(jq -r 'select(.reason == "compiler-artifact") | (.filenames[], .executable // empty)' "$json_file")
+
+  # Workspace binaries: inode match for hardlinked copies in deps/
+  while IFS= read -r exe; do
+    [[ -f "$exe" ]] || continue
+    [[ "$exe" == *"/deps/"* ]] && continue
+    while IFS= read -r dep_file; do
+      local dep_base
+      dep_base=$(basename "$dep_file")
+      if [[ "$dep_base" =~ -([a-f0-9]{16})(\.|$) ]]; then
+        live_hashes["${BASH_REMATCH[1]}"]=1
+        ((_merge_count++)) || true
+      fi
+    done < <(find "$deps_dir" -maxdepth 1 -samefile "$exe" 2>/dev/null)
+  done < <(jq -r 'select(.reason == "compiler-artifact") | (.executable // empty)' "$json_file")
+
+  # Crate names for incremental dir matching
+  while IFS= read -r name; do
+    live_crates["$name"]=1
+  done < <(jq -r 'select(.reason == "compiler-artifact") | .target.name' "$json_file" | sort -u)
+}
+
+# Try a cargo command for discovery. Runs it in background, watches stderr
+# for "Compiling". If seen → stale, kill it. If it finishes clean → merge hashes.
+# $1 = label, $2.. = cargo command
+try_discover() {
+  local label="$1"; shift
+  local json_file="$tmpdir/${label}.json"
+  local stderr_file="$tmpdir/${label}.stderr"
+
+  "$@" --message-format=json >"$json_file" 2>"$stderr_file" &
+  local pid=$!
+
+  local status="live"
+  while kill -0 "$pid" 2>/dev/null; do
+    if grep -q 'Compiling' "$stderr_file" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      status="stale"
+      break
+    fi
+    sleep 0.3
+  done
+
+  if [[ "$status" == "live" ]]; then
+    wait "$pid" 2>/dev/null || true
+    merge_hashes_from_json "$json_file"
+    echo "  $label: live ($_merge_count hashes)"
+  else
+    echo "  $label: stale (needs compilation, skipping)"
+  fi
+}
+
+echo "scanning targets..."
+
+# 1. Build — always run as baseline (instant when fresh)
+build_json="$tmpdir/build.json"
+cargo build --message-format=json >"$build_json" 2>/dev/null || true
+merge_hashes_from_json "$build_json"
+echo "  build: live ($_merge_count hashes)"
+
+if [[ ${#live_hashes[@]} -eq 0 ]]; then
+  echo "WARNING: build produced 0 hashes — something is wrong" >&2
+  exit 1
+fi
+
+# 2. Test — try and abort
+try_discover "test" cargo test --no-run
+
+# 3. Clippy — try and abort (only if installed)
+if command -v cargo-clippy &>/dev/null; then
+  try_discover "clippy" cargo clippy --no-deps
+fi
+
+echo "live hashes: ${#live_hashes[@]}"
+
+# Sweep deps/: anything whose hash isn't live.
+# Unidentified artifacts younger than --max-age are kept with a warning.
+max_age_secs=$((MAX_AGE_HOURS * 3600))
+now=$(date +%s)
+
+total=0
+removed=0
+kept_young=0
+oldest_unknown_age=0
+
+while IFS= read -r file; do
+  base=$(basename "$file")
+  if [[ "$base" =~ -([a-f0-9]{16})(\.|$) ]]; then
+    hash="${BASH_REMATCH[1]}"
+    if [[ -z "${live_hashes[$hash]:-}" ]]; then
+      mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
+      age=$((now - mtime))
+      size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+
+      if [[ $age -lt $max_age_secs ]]; then
+        ((kept_young++)) || true
+        if [[ $age -gt $oldest_unknown_age ]]; then
+          oldest_unknown_age=$age
+        fi
+      else
+        total=$((total + size))
+        ((removed++)) || true
+        if $DRY_RUN
+        then echo "  rm $base ($(numfmt --to=iec "$size"), age $(( age / 86400 ))d)"
+        else rm -f "$file"
+        fi
+      fi
+    fi
+  fi
+done < <(find "$deps_dir" -maxdepth 1 -type f)
+
+# Sweep incremental/: dirs whose crate name isn't live.
+inc_dir="$target_dir/debug/incremental"
+if [[ -d "$inc_dir" ]]; then
+  while IFS= read -r dir; do
+    base=$(basename "$dir")
+    crate_name="${base%-*}"
+    [[ "$crate_name" == "build_script_build" ]] && continue
+    if [[ -z "${live_crates[$crate_name]:-}" ]]; then
+      size=$(du -sb "$dir" 2>/dev/null | cut -f1)
+      total=$((total + size))
+      ((removed++)) || true
+      if $DRY_RUN
+      then echo "  rm -r incremental/$base ($(numfmt --to=iec "$size"))"
+      else rm -rf "$dir"
+      fi
+    fi
+  done < <(find "$inc_dir" -maxdepth 1 -mindepth 1 -type d)
+fi
+
+if [[ $kept_young -gt 0 ]]; then
+  echo "  unidentified: $kept_young artifacts kept (youngest < ${MAX_AGE_HOURS}h, oldest: $((oldest_unknown_age / 86400))d)"
+fi
+
+action="freed"
+$DRY_RUN && action="would free"
+echo "$removed artifacts, $action $(numfmt --to=iec $total)"

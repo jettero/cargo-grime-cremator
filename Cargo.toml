@@ -1,0 +1,31 @@
+[workspace]
+members = [".", "fixture"]
+default-members = ["."]
+resolver = "2"
+
+[package]
+name = "cargo-grime-cremator"
+version = "1.0.0"
+edition = "2021"
+description = "Garbage-collect stale files from cargo target directories without invoking the compiler"
+license = "MIT"
+repository = "https://github.com/jettero/cargo-grime-cremator"
+
+[[bin]]
+name = "cargo-gc"
+path = "src/main.rs"
+
+[lib]
+name = "cargo_grime_cremator"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+cargo_metadata = "0.18"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
+toml = "0.8"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
