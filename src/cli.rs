@@ -7,6 +7,7 @@ use std::path::PathBuf;
 #[command(
     name = "cargo-gc",
     bin_name = "cargo gc",
+    version,
     about = "Garbage-collect stale files from a cargo target directory",
     long_about = "Removes deps/, build/, and incremental/ artifacts that are no longer \
                   referenced by the project's current Cargo.lock — without invoking the \
