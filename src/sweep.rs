@@ -4,9 +4,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::inventory::{extract_deps_hash, parse_unit_dirname, to_snake, Inventory};
+use crate::inventory::{extract_deps_hash, invoked_mtime, parse_unit_dirname, to_snake, Inventory};
 use crate::live_set::LiveSet;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -108,6 +108,12 @@ fn sweep_profile(profile_dir: &Path, live: &LiveSet, opts: &SweepOptions) -> Res
     let mut inv = Inventory::build(profile_dir, live, opts.max_age_cutoff)?;
     let mut report = SweepReport::default();
 
+    // Workspace members recompile in seconds — keeping stale rlibs around
+    // risks ThinLTO symbol mismatches when split opt-levels are in play.
+    // Demote all-but-newest hashes so the existing sweep passes cascade
+    // the removal through deps/, build/, and .fingerprint/.
+    dedup_workspace_artifacts(profile_dir, &mut inv, live, opts)?;
+
     // Apply --prune-target by promoting matching live fingerprint hashes
     // to "stale". Cascades through deps/build/incremental/top-level
     // automatically because everything keys off `inv.live_hashes`.
@@ -167,6 +173,72 @@ fn promote_pruned_targets_to_stale(
             }
         }
     }
+    Ok(())
+}
+
+/// For workspace member crates with multiple live fingerprint hashes, keep
+/// only the newest and demote the rest to stale. This prevents ThinLTO
+/// symbol mismatches when split opt-levels cause dependencies to compile
+/// with hidden-visibility symbols that stale workspace rlibs reference by
+/// partition IDs from a previous compilation.
+fn dedup_workspace_artifacts(
+    profile_dir: &Path,
+    inv: &mut Inventory,
+    live: &LiveSet,
+    opts: &SweepOptions,
+) -> Result<()> {
+    let fp_dir = profile_dir.join(".fingerprint");
+    if !fp_dir.is_dir() {
+        return Ok(());
+    }
+
+    // Collect workspace member fingerprints that are currently live.
+    let mut ws_entries: HashMap<String, Vec<(String, std::time::SystemTime, PathBuf)>> =
+        HashMap::new();
+
+    for entry in std::fs::read_dir(&fp_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (crate_name, hash) = match parse_unit_dirname(&name) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !live.is_workspace_member(crate_name) {
+            continue;
+        }
+        if !inv.live_hashes.contains(hash) {
+            continue;
+        }
+        let ts = invoked_mtime(&entry.path()).unwrap_or(std::time::UNIX_EPOCH);
+        ws_entries.entry(crate_name.to_string()).or_default().push((
+            hash.to_string(),
+            ts,
+            entry.path(),
+        ));
+    }
+
+    for (crate_name, mut entries) in ws_entries {
+        if entries.len() <= 1 {
+            continue;
+        }
+        // Newest first
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        if opts.verbose {
+            println!(
+                "  dedup {}: keeping newest, demoting {} stale",
+                crate_name,
+                entries.len() - 1
+            );
+        }
+        for (hash, _, path) in entries.into_iter().skip(1) {
+            inv.live_hashes.remove(&hash);
+            inv.stale_fingerprints.push(path);
+        }
+    }
+
     Ok(())
 }
 
@@ -616,5 +688,73 @@ mod tests {
         names.insert("model_viewer".to_string());
         assert!(file_stem_matches("model-viewer", &names));
         assert!(file_stem_matches("model_viewer", &names));
+    }
+
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
+
+    fn make_fp_dir_with_ts(profile: &Path, name: &str, age_secs: u64) {
+        let d = profile.join(".fingerprint").join(name);
+        fs::create_dir_all(&d).unwrap();
+        let ts = d.join("invoked.timestamp");
+        fs::write(&ts, b"").unwrap();
+        let new_time = SystemTime::now() - Duration::from_secs(age_secs);
+        let f = std::fs::OpenOptions::new().write(true).open(&ts).unwrap();
+        f.set_modified(new_time).unwrap();
+    }
+
+    #[test]
+    fn dedup_keeps_only_newest_workspace_rlib() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().to_path_buf();
+
+        // Two fingerprints for workspace member "xp5" — old and new.
+        make_fp_dir_with_ts(&profile, "xp5-aaaaaaaaaaaaaaaa", 86_400); // 1 day old
+        make_fp_dir_with_ts(&profile, "xp5-bbbbbbbbbbbbbbbb", 0); // fresh
+
+        // A dependency "serde" also has two hashes — both should survive.
+        make_fp_dir_with_ts(&profile, "serde-1111111111111111", 86_400);
+        make_fp_dir_with_ts(&profile, "serde-2222222222222222", 0);
+
+        let live = LiveSet::from_names_with_ws(
+            ["xp5", "serde"],
+            ["xp5"], // only xp5 is a workspace member
+        );
+        let mut inv = Inventory::build(&profile, &live, None).unwrap();
+        assert_eq!(inv.live_hashes.len(), 4, "all 4 hashes start live");
+
+        let opts = SweepOptions::default();
+        dedup_workspace_artifacts(&profile, &mut inv, &live, &opts).unwrap();
+
+        // xp5: newest survives, older is demoted
+        assert!(inv.live_hashes.contains("bbbbbbbbbbbbbbbb"));
+        assert!(!inv.live_hashes.contains("aaaaaaaaaaaaaaaa"));
+        // serde: both survive (not a workspace member)
+        assert!(inv.live_hashes.contains("1111111111111111"));
+        assert!(inv.live_hashes.contains("2222222222222222"));
+        // one stale fingerprint added for old xp5
+        assert_eq!(inv.stale_fingerprints.len(), 1);
+        assert!(inv.stale_fingerprints[0]
+            .to_string_lossy()
+            .contains("aaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn dedup_noop_for_single_hash() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().to_path_buf();
+
+        make_fp_dir_with_ts(&profile, "xp5-aaaaaaaaaaaaaaaa", 0);
+
+        let live = LiveSet::from_names_with_ws(["xp5"], ["xp5"]);
+        let mut inv = Inventory::build(&profile, &live, None).unwrap();
+        assert_eq!(inv.live_hashes.len(), 1);
+
+        let opts = SweepOptions::default();
+        dedup_workspace_artifacts(&profile, &mut inv, &live, &opts).unwrap();
+
+        assert_eq!(inv.live_hashes.len(), 1);
+        assert!(inv.stale_fingerprints.is_empty());
     }
 }

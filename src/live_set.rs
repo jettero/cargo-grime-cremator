@@ -80,6 +80,10 @@ pub struct LiveSet {
     crates: HashSet<String>,
     /// `crates` mapped through snake_case (`-` → `_`).
     snake_crates: HashSet<String>,
+    /// Package names and target names that belong to workspace members
+    /// (not transitive dependencies). Used to identify crates whose stale
+    /// artifacts should be aggressively deduplicated.
+    workspace_members: HashSet<String>,
 }
 
 impl LiveSet {
@@ -87,13 +91,16 @@ impl LiveSet {
         let metadata = run_cargo_metadata(manifest_path)?;
 
         let mut crates: HashSet<String> = HashSet::new();
+        let mut workspace_members: HashSet<String> = HashSet::new();
         for pkg in &metadata.packages {
             crates.insert(pkg.name.clone());
         }
         for member_id in &metadata.workspace_members {
             if let Some(pkg) = metadata.packages.iter().find(|p| &p.id == member_id) {
+                workspace_members.insert(pkg.name.clone());
                 for target in &pkg.targets {
                     crates.insert(target.name.clone());
+                    workspace_members.insert(target.name.clone());
                 }
             }
         }
@@ -101,14 +108,15 @@ impl LiveSet {
         // build-script units regardless of the parent crate.
         crates.insert("build_script_build".to_string());
 
-        Ok(Self::from_set(crates))
+        Ok(Self::from_sets(crates, workspace_members))
     }
 
-    fn from_set(crates: HashSet<String>) -> Self {
+    fn from_sets(crates: HashSet<String>, workspace_members: HashSet<String>) -> Self {
         let snake_crates = crates.iter().map(|s| to_snake(s)).collect();
         Self {
             crates,
             snake_crates,
+            workspace_members,
         }
     }
 
@@ -120,7 +128,21 @@ impl LiveSet {
     {
         let mut crates: HashSet<String> = names.into_iter().map(|s| s.into()).collect();
         crates.insert("build_script_build".to_string());
-        Self::from_set(crates)
+        Self::from_sets(crates, HashSet::new())
+    }
+
+    #[cfg(test)]
+    pub fn from_names_with_ws<I, S, J, T>(names: I, ws: J) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        J: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let mut crates: HashSet<String> = names.into_iter().map(|s| s.into()).collect();
+        crates.insert("build_script_build".to_string());
+        let workspace_members: HashSet<String> = ws.into_iter().map(|s| s.into()).collect();
+        Self::from_sets(crates, workspace_members)
     }
 
     /// Match against original-case names (used for `.fingerprint/` prefixes).
@@ -139,6 +161,12 @@ impl LiveSet {
     /// kind of target produced them.
     pub fn matches_any(&self, name: &str) -> bool {
         self.crates.contains(name) || self.snake_crates.contains(name)
+    }
+
+    /// True if `name` is a workspace member package or target name (not a
+    /// transitive dependency).
+    pub fn is_workspace_member(&self, name: &str) -> bool {
+        self.workspace_members.contains(name)
     }
 
     pub fn len(&self) -> usize {

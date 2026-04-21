@@ -80,7 +80,7 @@ impl Inventory {
     }
 }
 
-fn invoked_mtime(fingerprint_dir: &Path) -> Option<SystemTime> {
+pub(crate) fn invoked_mtime(fingerprint_dir: &Path) -> Option<SystemTime> {
     let ts = fingerprint_dir.join("invoked.timestamp");
     if let Ok(meta) = std::fs::metadata(&ts) {
         if let Ok(m) = meta.modified() {
