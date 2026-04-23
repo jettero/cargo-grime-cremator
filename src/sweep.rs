@@ -108,11 +108,10 @@ fn sweep_profile(profile_dir: &Path, live: &LiveSet, opts: &SweepOptions) -> Res
     let mut inv = Inventory::build(profile_dir, live, opts.max_age_cutoff)?;
     let mut report = SweepReport::default();
 
-    // Workspace members recompile in seconds — keeping stale rlibs around
-    // risks ThinLTO symbol mismatches when split opt-levels are in play.
-    // Demote all-but-newest hashes so the existing sweep passes cascade
-    // the removal through deps/, build/, and .fingerprint/.
-    dedup_workspace_artifacts(profile_dir, &mut inv, live, opts)?;
+    // Within each (crate, target, profile) group, keep only the newest
+    // fingerprint. This removes stale remnants from previous build configs
+    // and prevents ThinLTO symbol mismatches in split opt-level setups.
+    dedup_stale_units(profile_dir, &mut inv, opts)?;
 
     // Apply --prune-target by promoting matching live fingerprint hashes
     // to "stale". Cascades through deps/build/incremental/top-level
@@ -176,24 +175,29 @@ fn promote_pruned_targets_to_stale(
     Ok(())
 }
 
-/// For workspace member crates with multiple live fingerprint hashes, keep
-/// only the newest and demote the rest to stale. This prevents ThinLTO
-/// symbol mismatches when split opt-levels cause dependencies to compile
-/// with hidden-visibility symbols that stale workspace rlibs reference by
-/// partition IDs from a previous compilation.
-fn dedup_workspace_artifacts(
-    profile_dir: &Path,
-    inv: &mut Inventory,
-    live: &LiveSet,
-    opts: &SweepOptions,
-) -> Result<()> {
+/// Dedup fingerprints within the same compilation unit.
+///
+/// Cargo's fingerprint dirs can accumulate when the metadata hash changes
+/// (e.g. features toggled, dependency graph shifted, rustc updated). Two
+/// fingerprints for the same crate are "same unit" when their JSON records
+/// identical `target` and `profile` hashes. Only the newest within each
+/// (crate_name, target, profile) group is kept; older ones are demoted to
+/// stale so the hash-keyed sweep passes cascade the cleanup through deps/,
+/// build/, and .fingerprint/.
+///
+/// This is critical for split opt-level setups where ThinLTO in dependencies
+/// marks symbols `hidden`. A stale dep rlib with different ThinLTO partition
+/// IDs can cause `undefined hidden symbol` linker errors if a workspace
+/// member was compiled against it.
+fn dedup_stale_units(profile_dir: &Path, inv: &mut Inventory, opts: &SweepOptions) -> Result<()> {
     let fp_dir = profile_dir.join(".fingerprint");
     if !fp_dir.is_dir() {
         return Ok(());
     }
 
-    // Collect workspace member fingerprints that are currently live.
-    let mut ws_entries: HashMap<String, Vec<(String, std::time::SystemTime, PathBuf)>> =
+    // Key: (crate_name, target_hash, profile_hash) — identifies one
+    // compilation unit. Value: list of (metadata_hash, timestamp, path).
+    let mut units: HashMap<(String, u64, u64), Vec<(String, std::time::SystemTime, PathBuf)>> =
         HashMap::new();
 
     for entry in std::fs::read_dir(&fp_dir)? {
@@ -201,26 +205,26 @@ fn dedup_workspace_artifacts(
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let (crate_name, hash) = match parse_unit_dirname(&name) {
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let (crate_name, hash) = match parse_unit_dirname(&dir_name) {
             Some(p) => p,
             None => continue,
         };
-        if !live.is_workspace_member(crate_name) {
-            continue;
-        }
         if !inv.live_hashes.contains(hash) {
             continue;
         }
+        let (target, profile) = match read_unit_key(&entry.path()) {
+            Some(k) => k,
+            None => continue, // can't determine unit identity → leave alone
+        };
         let ts = invoked_mtime(&entry.path()).unwrap_or(std::time::UNIX_EPOCH);
-        ws_entries.entry(crate_name.to_string()).or_default().push((
-            hash.to_string(),
-            ts,
-            entry.path(),
-        ));
+        units
+            .entry((crate_name.to_string(), target, profile))
+            .or_default()
+            .push((hash.to_string(), ts, entry.path()));
     }
 
-    for (crate_name, mut entries) in ws_entries {
+    for ((crate_name, _, _), mut entries) in units {
         if entries.len() <= 1 {
             continue;
         }
@@ -240,6 +244,40 @@ fn dedup_workspace_artifacts(
     }
 
     Ok(())
+}
+
+/// Read the fingerprint JSON in `fp_dir` and extract the (target, profile)
+/// pair that identifies which compilation unit produced these artifacts.
+/// Returns None if the JSON can't be read or parsed.
+fn read_unit_key(fp_dir: &Path) -> Option<(u64, u64)> {
+    // The JSON file is named like `lib-<crate>.json` or `test-lib-<crate>.json`.
+    for entry in std::fs::read_dir(fp_dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()).ok()?;
+        let target = extract_json_u64(&content, "target")?;
+        let profile = extract_json_u64(&content, "profile")?;
+        return Some((target, profile));
+    }
+    None
+}
+
+/// Extract an integer value for a given key from a flat JSON object.
+/// Handles the format `"key":12345` with optional whitespace.
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
 }
 
 fn sweep_deps(
@@ -694,7 +732,15 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
-    fn make_fp_dir_with_ts(profile: &Path, name: &str, age_secs: u64) {
+    /// Create a fingerprint dir with a JSON file containing the given
+    /// target and profile hashes, and an invoked.timestamp aged by `age_secs`.
+    fn make_fp_dir_with_unit(
+        profile: &Path,
+        name: &str,
+        target: u64,
+        profile_hash: u64,
+        age_secs: u64,
+    ) {
         let d = profile.join(".fingerprint").join(name);
         fs::create_dir_all(&d).unwrap();
         let ts = d.join("invoked.timestamp");
@@ -702,42 +748,64 @@ mod tests {
         let new_time = SystemTime::now() - Duration::from_secs(age_secs);
         let f = std::fs::OpenOptions::new().write(true).open(&ts).unwrap();
         f.set_modified(new_time).unwrap();
+
+        // The crate name is everything before the last -<hash>.
+        let crate_name = name.rsplitn(2, '-').nth(1).unwrap_or(name);
+        let json = format!(
+            r#"{{"rustc":0,"features":"[]","declared_features":"[]","target":{},"profile":{},"path":0,"deps":[],"local":[],"rustflags":[],"config":0,"compile_kind":0}}"#,
+            target, profile_hash
+        );
+        fs::write(d.join(format!("lib-{}.json", crate_name)), json).unwrap();
     }
 
     #[test]
-    fn dedup_keeps_only_newest_workspace_rlib() {
+    fn dedup_same_unit_keeps_only_newest() {
         let dir = tempdir().unwrap();
         let profile = dir.path().to_path_buf();
 
-        // Two fingerprints for workspace member "xp5" — old and new.
-        make_fp_dir_with_ts(&profile, "xp5-aaaaaaaaaaaaaaaa", 86_400); // 1 day old
-        make_fp_dir_with_ts(&profile, "xp5-bbbbbbbbbbbbbbbb", 0); // fresh
+        // Two fingerprints for "xp5" with SAME (target, profile) — same unit.
+        make_fp_dir_with_unit(&profile, "xp5-aaaaaaaaaaaaaaaa", 100, 200, 86_400);
+        make_fp_dir_with_unit(&profile, "xp5-bbbbbbbbbbbbbbbb", 100, 200, 0);
 
-        // A dependency "serde" also has two hashes — both should survive.
-        make_fp_dir_with_ts(&profile, "serde-1111111111111111", 86_400);
-        make_fp_dir_with_ts(&profile, "serde-2222222222222222", 0);
+        // Two fingerprints for "serde" with SAME (target, profile) — same unit.
+        make_fp_dir_with_unit(&profile, "serde-1111111111111111", 300, 400, 86_400);
+        make_fp_dir_with_unit(&profile, "serde-2222222222222222", 300, 400, 0);
 
-        let live = LiveSet::from_names_with_ws(
-            ["xp5", "serde"],
-            ["xp5"], // only xp5 is a workspace member
-        );
+        let live = LiveSet::from_names(["xp5", "serde"]);
         let mut inv = Inventory::build(&profile, &live, None).unwrap();
         assert_eq!(inv.live_hashes.len(), 4, "all 4 hashes start live");
 
         let opts = SweepOptions::default();
-        dedup_workspace_artifacts(&profile, &mut inv, &live, &opts).unwrap();
+        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
 
-        // xp5: newest survives, older is demoted
+        // Both crates: newest survives, older is demoted.
         assert!(inv.live_hashes.contains("bbbbbbbbbbbbbbbb"));
         assert!(!inv.live_hashes.contains("aaaaaaaaaaaaaaaa"));
-        // serde: both survive (not a workspace member)
-        assert!(inv.live_hashes.contains("1111111111111111"));
         assert!(inv.live_hashes.contains("2222222222222222"));
-        // one stale fingerprint added for old xp5
-        assert_eq!(inv.stale_fingerprints.len(), 1);
-        assert!(inv.stale_fingerprints[0]
-            .to_string_lossy()
-            .contains("aaaaaaaaaaaaaaaa"));
+        assert!(!inv.live_hashes.contains("1111111111111111"));
+        assert_eq!(inv.stale_fingerprints.len(), 2);
+    }
+
+    #[test]
+    fn dedup_different_units_keeps_both() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().to_path_buf();
+
+        // Two fingerprints for "anyhow" with DIFFERENT target hashes —
+        // different compilation units (e.g. lib vs build-script).
+        make_fp_dir_with_unit(&profile, "anyhow-aaaaaaaaaaaaaaaa", 100, 200, 86_400);
+        make_fp_dir_with_unit(&profile, "anyhow-bbbbbbbbbbbbbbbb", 999, 200, 0);
+
+        let live = LiveSet::from_names(["anyhow"]);
+        let mut inv = Inventory::build(&profile, &live, None).unwrap();
+        assert_eq!(inv.live_hashes.len(), 2);
+
+        let opts = SweepOptions::default();
+        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
+
+        // Both survive — different units.
+        assert_eq!(inv.live_hashes.len(), 2);
+        assert!(inv.stale_fingerprints.is_empty());
     }
 
     #[test]
@@ -745,14 +813,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let profile = dir.path().to_path_buf();
 
-        make_fp_dir_with_ts(&profile, "xp5-aaaaaaaaaaaaaaaa", 0);
+        make_fp_dir_with_unit(&profile, "xp5-aaaaaaaaaaaaaaaa", 100, 200, 0);
 
-        let live = LiveSet::from_names_with_ws(["xp5"], ["xp5"]);
+        let live = LiveSet::from_names(["xp5"]);
         let mut inv = Inventory::build(&profile, &live, None).unwrap();
         assert_eq!(inv.live_hashes.len(), 1);
 
         let opts = SweepOptions::default();
-        dedup_workspace_artifacts(&profile, &mut inv, &live, &opts).unwrap();
+        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
 
         assert_eq!(inv.live_hashes.len(), 1);
         assert!(inv.stale_fingerprints.is_empty());

@@ -339,3 +339,171 @@ fn idempotence_loop() {
         assert_eq!(r, 0, "iteration {}: gc must remove nothing", i);
     }
 }
+
+/// Simulate the ThinLTO split-opt-level linker breakage scenario.
+///
+/// When a dependency crate has MULTIPLE fingerprints for the same compilation
+/// unit (same target + profile in the fingerprint JSON), only the newest is
+/// current — the older one is a stale remnant from a previous build config.
+/// A workspace member compiled against the stale dep may reference ThinLTO
+/// partition symbols that no longer match, causing linker errors.
+///
+/// cargo-gc should dedup fingerprints within the same (crate, target, profile)
+/// group, keeping only the newest. This removes the stale dep rlib; cargo
+/// then notices the missing dep on the next build and recompiles the workspace
+/// member against the current dep.
+#[test]
+#[ignore = "slow: invokes cargo build on the fixture workspace member"]
+fn dedup_stale_dep_fingerprint_same_unit() {
+    let tmp = tempdir();
+    let target = tmp.path().join("target");
+    build_fixture(&target, false);
+
+    let fp_dir = target.join("debug/.fingerprint");
+    let deps_dir = target.join("debug/deps");
+
+    // Find the ACTUAL serde rlib in deps/ — only one should exist.
+    let real_serde_hash = find_rlib_hash(&deps_dir, "serde");
+
+    // Find the matching fingerprint dir and read its JSON.
+    let real_fp_dir = fp_dir.join(format!("serde-{}", real_serde_hash));
+    assert!(
+        real_fp_dir.is_dir(),
+        "fingerprint dir must exist for the rlib hash"
+    );
+    let json_file = find_json_in_fingerprint(&real_fp_dir);
+    let json_content = std::fs::read_to_string(&json_file).unwrap();
+
+    // Create a fake "stale" serde fingerprint with the SAME target and profile
+    // (simulating a previous compilation of the same unit) but a different hash
+    // and an older timestamp.
+    let fake_hash = "ffffffffffffffff";
+    let fake_fp_dir = fp_dir.join(format!("serde-{}", fake_hash));
+    std::fs::create_dir_all(&fake_fp_dir).unwrap();
+
+    // Write the same JSON (same target, same profile) under the expected filename.
+    let json_name = json_file
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(fake_fp_dir.join(&json_name), &json_content).unwrap();
+
+    // Write invoked.timestamp with an OLD mtime (24h ago).
+    let ts = fake_fp_dir.join("invoked.timestamp");
+    std::fs::write(&ts, b"").unwrap();
+    let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ts)
+        .unwrap()
+        .set_modified(old_time)
+        .unwrap();
+
+    // Write the fingerprint hash file (same name pattern as the real one).
+    let hash_file_name = json_name.trim_end_matches(".json");
+    std::fs::write(fake_fp_dir.join(hash_file_name), b"deadbeefdeadbeef").unwrap();
+
+    // Plant a matching fake rlib in deps/.
+    let fake_rlib = deps_dir.join(format!("libserde-{}.rlib", fake_hash));
+    std::fs::write(&fake_rlib, b"fake stale rlib content").unwrap();
+
+    // Sanity: both the real and fake serde rlibs exist.
+    let serde_rlib_count = count_files_matching(&deps_dir, "libserde-", ".rlib");
+    assert_eq!(
+        serde_rlib_count, 2,
+        "expected exactly 2 serde rlibs (real + fake), got {}",
+        serde_rlib_count
+    );
+
+    // Run gc — the dedup should detect two fingerprints for serde with the
+    // same (target, profile) and remove the older one (our fake).
+    let (removed, summary) = run_gc(&target, false);
+    eprintln!("stale-dep dedup gc: {} (removed {})", summary, removed);
+
+    assert!(
+        !fake_rlib.exists(),
+        "fake stale rlib should have been swept: {}",
+        fake_rlib.display()
+    );
+    assert!(
+        !fake_fp_dir.exists(),
+        "fake stale fingerprint dir should have been swept: {}",
+        fake_fp_dir.display()
+    );
+
+    // The real serde rlib must survive.
+    let real_rlib = deps_dir.join(format!("libserde-{}.rlib", real_serde_hash));
+    assert!(
+        real_rlib.exists(),
+        "real serde rlib must survive: {}",
+        real_rlib.display()
+    );
+
+    // Dual mandate: rebuild must compile nothing (we only removed stale artifacts).
+    let n = build_fixture(&target, false);
+    assert_eq!(
+        n, 0,
+        "rebuild after stale-dep dedup must compile zero units"
+    );
+
+    // Second gc must be a no-op.
+    let (removed2, _) = run_gc(&target, false);
+    assert_eq!(removed2, 0, "second gc must remove nothing");
+}
+
+// ── helpers for the stale-dep test ──
+
+/// Find the 16-hex hash of the rlib for a given crate in deps/.
+/// Panics if zero or more than one rlib matches.
+fn find_rlib_hash(deps_dir: &Path, crate_name: &str) -> String {
+    let prefix = format!("lib{}-", crate_name.replace('-', "_"));
+    let suffix = ".rlib";
+    let matches: Vec<String> = std::fs::read_dir(deps_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&prefix) && n.ends_with(suffix) {
+                let hash = &n[prefix.len()..n.len() - suffix.len()];
+                if hash.len() == 16 {
+                    return Some(hash.to_string());
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly 1 {} rlib, found {}: {:?}",
+        crate_name,
+        matches.len(),
+        matches
+    );
+    matches.into_iter().next().unwrap()
+}
+
+/// Find the .json file inside a fingerprint dir.
+fn find_json_in_fingerprint(fp_dir: &Path) -> PathBuf {
+    for entry in std::fs::read_dir(fp_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".json") {
+            return entry.path();
+        }
+    }
+    panic!("no .json file in fingerprint dir: {}", fp_dir.display());
+}
+
+/// Count files in `dir` whose name starts with `prefix` and ends with `suffix`.
+fn count_files_matching(dir: &Path, prefix: &str, suffix: &str) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(prefix) && n.ends_with(suffix)
+        })
+        .count()
+}
