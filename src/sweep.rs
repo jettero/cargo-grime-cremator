@@ -195,10 +195,9 @@ fn dedup_stale_units(profile_dir: &Path, inv: &mut Inventory, opts: &SweepOption
         return Ok(());
     }
 
-    // Key: (crate_name, target_hash, profile_hash) — identifies one
-    // compilation unit. Value: list of (metadata_hash, timestamp, path).
-    let mut units: HashMap<(String, u64, u64), Vec<(String, std::time::SystemTime, PathBuf)>> =
-        HashMap::new();
+    type UnitKey = (String, u64, u64); // (crate_name, target_hash, profile_hash)
+    type FpEntry = (String, std::time::SystemTime, PathBuf); // (metadata_hash, ts, path)
+    let mut units: HashMap<UnitKey, Vec<FpEntry>> = HashMap::new();
 
     for entry in std::fs::read_dir(&fp_dir)? {
         let entry = entry?;
@@ -750,7 +749,7 @@ mod tests {
         f.set_modified(new_time).unwrap();
 
         // The crate name is everything before the last -<hash>.
-        let crate_name = name.rsplitn(2, '-').nth(1).unwrap_or(name);
+        let crate_name = name.rsplit_once('-').map(|x| x.0).unwrap_or(name);
         let json = format!(
             r#"{{"rustc":0,"features":"[]","declared_features":"[]","target":{},"profile":{},"path":0,"deps":[],"local":[],"rustflags":[],"config":0,"compile_kind":0}}"#,
             target, profile_hash
