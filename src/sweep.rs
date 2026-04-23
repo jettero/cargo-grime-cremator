@@ -276,21 +276,25 @@ fn dedup_stale_units(
     // internals, but workspace members recompile in seconds. Remove them
     // all so the next build links cleanly.
     if dep_deduped {
-        purge_workspace_fingerprints(&fp_dir, inv, live, opts)?;
+        purge_workspace_zombies(profile_dir, &fp_dir, inv, live, opts)?;
     }
 
     Ok(())
 }
 
-/// Remove all workspace member fingerprints from `live_hashes` and mark
-/// them stale. Called when a dependency was deduped — workspace members
-/// may hold stale ThinLTO symbol references to the removed dep rlib.
-fn purge_workspace_fingerprints(
+/// Remove all workspace member fingerprints, deps/ artifacts, and incremental
+/// cache when a dependency was deduped. Without the incremental cache removal,
+/// cargo does an incremental recompile reusing poisoned codegen units from
+/// the cache → produces an identical broken rlib.
+fn purge_workspace_zombies(
+    profile_dir: &Path,
     fp_dir: &Path,
     inv: &mut Inventory,
     live: &LiveSet,
     opts: &SweepOptions,
 ) -> Result<()> {
+    // 1. Remove workspace member fingerprints from live_hashes.
+    let mut any_zombie = false;
     for entry in std::fs::read_dir(fp_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -313,9 +317,45 @@ fn purge_workspace_fingerprints(
                 crate_name, hash
             );
         }
+        any_zombie = true;
         inv.live_hashes.remove(hash);
         inv.stale_fingerprints.push(entry.path());
     }
+
+    if !any_zombie {
+        return Ok(());
+    }
+
+    // All workspace member names (package + target) in both original and
+    // snake_case form — needed because incremental/ dirs use target names,
+    // which may differ from the package names found in .fingerprint/.
+    let zombie_prefixes = live.workspace_member_prefixes();
+
+    // 2. Remove ALL incremental cache dirs for zombie workspace members.
+    //    Incremental dirs are named <crate_snake>-<rustc_hash> — match by
+    //    prefix. Without this, cargo does incremental recompile reusing
+    //    poisoned codegen units → same broken rlib.
+    let inc_dir = profile_dir.join("incremental");
+    if inc_dir.is_dir() {
+        for entry in std::fs::read_dir(&inc_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let prefix = match name.rfind('-') {
+                Some(idx) => &name[..idx],
+                None => continue,
+            };
+            if zombie_prefixes.contains(prefix) {
+                if opts.verbose {
+                    println!("  zombie: removing incremental cache {}", name);
+                }
+                remove_dir(&entry.path(), opts, &mut SweepReport::default())?;
+            }
+        }
+    }
+
     Ok(())
 }
 

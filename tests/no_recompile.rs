@@ -419,25 +419,44 @@ fn dedup_stale_dep_fingerprint_same_unit() {
     assert_eq!(n2, 0, "third build must compile nothing");
 }
 
-/// cargo-gc should detect that the workspace member's compilation predates
-/// the newest dep compilation for the same unit and remove the workspace
-/// member's artifacts. The next `cargo build` then recompiles the workspace
-/// member against the current dep.
+/// Full zombie dep chain eviction: when a dep is deduped and workspace
+/// members are zombie-purged, THREE things must be removed:
 ///
-/// This test simulates the scenario by planting a NEWER dep fingerprint (same
-/// unit type). The real dep becomes "old" and gets deduped. The workspace
-/// member was compiled against that now-removed dep → it's a zombie.
+/// 1. Zombie workspace rlib + fingerprint
+/// 2. ALL rlibs for the deduped dep (not just the unit-key group)
+/// 3. Workspace member incremental cache (incremental/<ws_member>-*)
+///
+/// Without #3, cargo does an incremental recompile reusing poisoned codegen
+/// units from the cache → produces an identical broken rlib. Without #2,
+/// cargo links the recompiled workspace member against the same poisoned dep.
+/// All three must go together.
 #[test]
-fn zombie_workspace_member_removed_when_dep_superseded() {
+fn zombie_full_chain_eviction() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
+
+    // 1. Build fixture, verify clean state.
     build_fixture(&target, false);
+    let n_warmup = build_fixture(&target, false);
+    assert_eq!(n_warmup, 0, "warm build should be a no-op");
 
     let fp_dir = target.join("debug/.fingerprint");
     let deps_dir = target.join("debug/deps");
+    let inc_dir = target.join("debug/incremental");
 
-    // Find the real serde rlib hash and its fingerprint.
+    // 2. Note current state.
     let real_serde_hash = find_rlib_hash(&deps_dir, "serde");
+    let fixture_fp_hash = find_fingerprint_hash(&fp_dir, "cargo-gc-fixture");
+
+    // 3. Verify incremental cache exists for the fixture binary.
+    //    The binary target is "fixture" so incremental dirs are "fixture-*".
+    let fixture_inc_before = count_dirs_with_prefix(&inc_dir, "fixture-");
+    assert!(
+        fixture_inc_before > 0,
+        "fixture should have incremental cache dirs before gc"
+    );
+
+    // 4. Plant a FAKE newer serde fingerprint to trigger dep dedup → zombie.
     let real_serde_fp = fp_dir.join(format!("serde-{}", real_serde_hash));
     let json_file = find_json_in_fingerprint(&real_serde_fp);
     let json_content = std::fs::read_to_string(&json_file).unwrap();
@@ -447,19 +466,12 @@ fn zombie_workspace_member_removed_when_dep_superseded() {
         .to_string_lossy()
         .into_owned();
 
-    // Find the fixture's workspace member fingerprint.
-    let fixture_fp_hash = find_fingerprint_hash(&fp_dir, "cargo-gc-fixture");
-
-    // Plant a NEWER serde fingerprint — same (target, profile), but with a
-    // future-ish timestamp so it wins the dedup. This makes the REAL serde
-    // the "old" one that gets removed.
     let fake_hash = "ffffffffffffffff";
     let fake_fp_dir = fp_dir.join(format!("serde-{}", fake_hash));
     std::fs::create_dir_all(&fake_fp_dir).unwrap();
     std::fs::write(fake_fp_dir.join(&json_name), &json_content).unwrap();
     let ts = fake_fp_dir.join("invoked.timestamp");
     std::fs::write(&ts, b"").unwrap();
-    // Set the fake to 1 second in the future so it's strictly newer.
     let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
     std::fs::OpenOptions::new()
         .write(true)
@@ -469,48 +481,71 @@ fn zombie_workspace_member_removed_when_dep_superseded() {
         .unwrap();
     let hash_file_name = json_name.trim_end_matches(".json");
     std::fs::write(fake_fp_dir.join(hash_file_name), b"fakeeeeeeeeeeeee").unwrap();
-    // Plant a fake rlib so there's something for deps/ to keep.
     std::fs::write(
         deps_dir.join(format!("libserde-{}.rlib", fake_hash)),
         b"fake newer rlib",
     )
     .unwrap();
 
-    // Sanity: the real serde rlib exists before gc.
-    let real_rlib = deps_dir.join(format!("libserde-{}.rlib", real_serde_hash));
-    assert!(real_rlib.exists(), "real serde rlib must exist before gc");
-
-    // Run gc.
+    // 5. Run gc.
     let (_removed, summary) = run_gc(&target, false);
-    eprintln!("zombie gc: {}", summary);
+    eprintln!("zombie chain gc: {}", summary);
 
-    // The dedup should have removed the REAL serde (it's now the older one).
-    assert!(
-        !real_rlib.exists(),
-        "real (now-old) serde rlib should have been swept"
-    );
-
-    // ── This is the zombie detection assertion ──
-    // The fixture was compiled against the real serde (now removed).
-    // Its rlib/fingerprint should ALSO be removed because it's a zombie.
+    // 6. Assert #1: zombie workspace fingerprint removed.
     let fixture_fp = fp_dir.join(format!("cargo-gc-fixture-{}", fixture_fp_hash));
     assert!(
         !fixture_fp.exists(),
-        "fixture fingerprint should be removed (zombie — compiled against \
-         superseded dep)"
+        "fixture fingerprint should be removed (zombie)"
     );
 
-    // After zombie + dep chain removal, rebuild recompiles the affected dep
-    // (serde) and the workspace member. Much less than a full cold build.
-    let cold_build_units = 50;
-    let n = build_fixture(&target, false);
-    assert!(n > 0, "rebuild must recompile the workspace member");
-    assert!(
-        n < cold_build_units,
-        "rebuild should recompile affected deps + workspace member, \
-         not everything (got {})",
-        n
+    // 7. Assert #2: ALL serde rlibs removed (both real and fake).
+    let serde_rlibs_after = count_files_with_prefix_suffix(&deps_dir, "libserde-", ".rlib");
+    assert_eq!(
+        serde_rlibs_after, 0,
+        "ALL serde rlibs must be removed when serde was deduped — \
+         keeping any risks recompilation against poisoned ThinLTO symbols"
     );
+
+    // 8. Assert #3: workspace incremental cache removed.
+    let fixture_inc_after = count_dirs_with_prefix(&inc_dir, "fixture-");
+    assert_eq!(
+        fixture_inc_after, 0,
+        "fixture incremental cache must be removed when zombie is detected — \
+         without this, cargo does incremental recompile using poisoned codegen \
+         units and produces the same broken rlib"
+    );
+
+    // 9. Rebuild must succeed and recover.
+    let n = build_fixture(&target, false);
+    assert!(n > 0, "should recompile after gc cleanup");
+
+    // 10. Second build is stable (convergence).
+    let n2 = build_fixture(&target, false);
+    assert_eq!(n2, 0, "recovered build should be stable");
+}
+
+/// Count directories in `dir` whose name starts with `prefix`.
+fn count_dirs_with_prefix(dir: &Path, prefix: &str) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.file_name().to_string_lossy().starts_with(prefix)
+        })
+        .count()
+}
+
+/// Count files in `dir` matching prefix and suffix.
+fn count_files_with_prefix_suffix(dir: &Path, prefix: &str, suffix: &str) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(prefix) && n.ends_with(suffix)
+        })
+        .count()
 }
 
 /// Find a fingerprint hash for a crate that has a fingerprint dir.

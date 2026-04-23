@@ -169,6 +169,17 @@ impl LiveSet {
         self.workspace_members.contains(name)
     }
 
+    /// All workspace member names (package + target) and their snake_case
+    /// forms. Used to match incremental/ dir prefixes during zombie purge.
+    pub fn workspace_member_prefixes(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for name in &self.workspace_members {
+            out.insert(name.clone());
+            out.insert(to_snake(name));
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.crates.len()
     }
