@@ -10,7 +10,19 @@ use cargo_grime_cremator::{
 fn main() -> Result<()> {
     let cli = Cli::parse_args();
 
-    let paths = target_dir::resolve(cli.target_dir.as_deref(), cli.manifest_path.as_deref())?;
+    // --project <dir> is shorthand for --manifest-path <dir>/Cargo.toml
+    let manifest_override = cli
+        .manifest_path
+        .as_deref()
+        .or(cli.project.as_deref())
+        .map(|p| {
+            if p.join("Cargo.toml").is_file() {
+                p.join("Cargo.toml")
+            } else {
+                p.to_path_buf()
+            }
+        });
+    let paths = target_dir::resolve(cli.target_dir.as_deref(), manifest_override.as_deref())?;
 
     if cli.verbose {
         println!("manifest: {}", paths.manifest_path.display());

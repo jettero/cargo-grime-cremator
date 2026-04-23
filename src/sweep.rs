@@ -111,7 +111,7 @@ fn sweep_profile(profile_dir: &Path, live: &LiveSet, opts: &SweepOptions) -> Res
     // Within each (crate, target, profile) group, keep only the newest
     // fingerprint. This removes stale remnants from previous build configs
     // and prevents ThinLTO symbol mismatches in split opt-level setups.
-    dedup_stale_units(profile_dir, &mut inv, opts)?;
+    dedup_stale_units(profile_dir, &mut inv, live, opts)?;
 
     // Apply --prune-target by promoting matching live fingerprint hashes
     // to "stale". Cascades through deps/build/incremental/top-level
@@ -189,7 +189,12 @@ fn promote_pruned_targets_to_stale(
 /// marks symbols `hidden`. A stale dep rlib with different ThinLTO partition
 /// IDs can cause `undefined hidden symbol` linker errors if a workspace
 /// member was compiled against it.
-fn dedup_stale_units(profile_dir: &Path, inv: &mut Inventory, opts: &SweepOptions) -> Result<()> {
+fn dedup_stale_units(
+    profile_dir: &Path,
+    inv: &mut Inventory,
+    live: &LiveSet,
+    opts: &SweepOptions,
+) -> Result<()> {
     let fp_dir = profile_dir.join(".fingerprint");
     if !fp_dir.is_dir() {
         return Ok(());
@@ -223,25 +228,94 @@ fn dedup_stale_units(profile_dir: &Path, inv: &mut Inventory, opts: &SweepOption
             .push((hash.to_string(), ts, entry.path()));
     }
 
+    let mut dep_deduped = false;
     for ((crate_name, _, _), mut entries) in units {
         if entries.len() <= 1 {
             continue;
         }
-        // Newest first
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
-        if opts.verbose {
-            println!(
-                "  dedup {}: keeping newest, demoting {} stale",
-                crate_name,
-                entries.len() - 1
-            );
-        }
-        for (hash, _, path) in entries.into_iter().skip(1) {
-            inv.live_hashes.remove(&hash);
-            inv.stale_fingerprints.push(path);
+        if live.is_workspace_member(&crate_name) {
+            // Workspace members: keep newest, remove old. They recompile
+            // in seconds either way.
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            if opts.verbose {
+                println!(
+                    "  dedup {}: keeping newest, demoting {} stale",
+                    crate_name,
+                    entries.len() - 1
+                );
+            }
+            for (hash, _, path) in entries.into_iter().skip(1) {
+                inv.live_hashes.remove(&hash);
+                inv.stale_fingerprints.push(path);
+            }
+        } else {
+            // Dependency: nuke ALL artifacts for this unit. We can't trust
+            // invoked.timestamp to identify the "good" one (cargo touches
+            // it on fingerprint checks, not just compilation), and ThinLTO
+            // partitions in any survivor may be incompatible. Cargo will
+            // recompile the dep fresh (~10-15s one-time cost).
+            dep_deduped = true;
+            if opts.verbose {
+                println!(
+                    "  dedup {}: removing all {} (dep had stale duplicates)",
+                    crate_name,
+                    entries.len()
+                );
+            }
+            for (hash, _, path) in entries {
+                inv.live_hashes.remove(&hash);
+                inv.stale_fingerprints.push(path);
+            }
         }
     }
 
+    // If any dependency was deduped, workspace members that were compiled
+    // against the old dep are zombies — their rlibs contain stale symbol
+    // references (ThinLTO partition IDs) that will fail at link time.
+    // We can't tell which workspace members are affected without cargo
+    // internals, but workspace members recompile in seconds. Remove them
+    // all so the next build links cleanly.
+    if dep_deduped {
+        purge_workspace_fingerprints(&fp_dir, inv, live, opts)?;
+    }
+
+    Ok(())
+}
+
+/// Remove all workspace member fingerprints from `live_hashes` and mark
+/// them stale. Called when a dependency was deduped — workspace members
+/// may hold stale ThinLTO symbol references to the removed dep rlib.
+fn purge_workspace_fingerprints(
+    fp_dir: &Path,
+    inv: &mut Inventory,
+    live: &LiveSet,
+    opts: &SweepOptions,
+) -> Result<()> {
+    for entry in std::fs::read_dir(fp_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let (crate_name, hash) = match parse_unit_dirname(&dir_name) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !live.is_workspace_member(crate_name) {
+            continue;
+        }
+        if !inv.live_hashes.contains(hash) {
+            continue;
+        }
+        if opts.verbose {
+            println!(
+                "  zombie: removing {}-{} (dep was superseded)",
+                crate_name, hash
+            );
+        }
+        inv.live_hashes.remove(hash);
+        inv.stale_fingerprints.push(entry.path());
+    }
     Ok(())
 }
 
@@ -762,27 +836,51 @@ mod tests {
         let dir = tempdir().unwrap();
         let profile = dir.path().to_path_buf();
 
-        // Two fingerprints for "xp5" with SAME (target, profile) — same unit.
-        make_fp_dir_with_unit(&profile, "xp5-aaaaaaaaaaaaaaaa", 100, 200, 86_400);
-        make_fp_dir_with_unit(&profile, "xp5-bbbbbbbbbbbbbbbb", 100, 200, 0);
-
-        // Two fingerprints for "serde" with SAME (target, profile) — same unit.
+        // Two fingerprints for "serde" with SAME (target, profile).
         make_fp_dir_with_unit(&profile, "serde-1111111111111111", 300, 400, 86_400);
         make_fp_dir_with_unit(&profile, "serde-2222222222222222", 300, 400, 0);
 
-        let live = LiveSet::from_names(["xp5", "serde"]);
+        // No workspace members → pure dep dedup, no zombie purge.
+        // But ALL dep entries in the group get nuked (not just the older one).
+        let live = LiveSet::from_names(["serde"]);
         let mut inv = Inventory::build(&profile, &live, None).unwrap();
-        assert_eq!(inv.live_hashes.len(), 4, "all 4 hashes start live");
+        assert_eq!(inv.live_hashes.len(), 2);
 
         let opts = SweepOptions::default();
-        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
+        dedup_stale_units(&profile, &mut inv, &live, &opts).unwrap();
 
-        // Both crates: newest survives, older is demoted.
-        assert!(inv.live_hashes.contains("bbbbbbbbbbbbbbbb"));
-        assert!(!inv.live_hashes.contains("aaaaaaaaaaaaaaaa"));
-        assert!(inv.live_hashes.contains("2222222222222222"));
+        // Both serde hashes removed — dep with duplicates gets fully nuked.
+        assert!(!inv.live_hashes.contains("2222222222222222"));
         assert!(!inv.live_hashes.contains("1111111111111111"));
         assert_eq!(inv.stale_fingerprints.len(), 2);
+    }
+
+    #[test]
+    fn dep_dedup_purges_workspace_zombies() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().to_path_buf();
+
+        // Workspace member "xp5" — single fingerprint, should be a zombie.
+        make_fp_dir_with_unit(&profile, "xp5-aaaaaaaaaaaaaaaa", 100, 200, 0);
+
+        // Dependency "serde" — two fingerprints for same unit → dedup.
+        make_fp_dir_with_unit(&profile, "serde-1111111111111111", 300, 400, 86_400);
+        make_fp_dir_with_unit(&profile, "serde-2222222222222222", 300, 400, 0);
+
+        let live = LiveSet::from_names_with_ws(["xp5", "serde"], ["xp5"]);
+        let mut inv = Inventory::build(&profile, &live, None).unwrap();
+        assert_eq!(inv.live_hashes.len(), 3);
+
+        let opts = SweepOptions::default();
+        dedup_stale_units(&profile, &mut inv, &live, &opts).unwrap();
+
+        // serde: ALL entries nuked (dep with duplicates).
+        assert!(!inv.live_hashes.contains("2222222222222222"));
+        assert!(!inv.live_hashes.contains("1111111111111111"));
+        // xp5: purged as zombie because a dep was deduped.
+        assert!(!inv.live_hashes.contains("aaaaaaaaaaaaaaaa"));
+        // 2 stale serde + 1 zombie xp5 = 3 stale fingerprints.
+        assert_eq!(inv.stale_fingerprints.len(), 3);
     }
 
     #[test]
@@ -800,7 +898,7 @@ mod tests {
         assert_eq!(inv.live_hashes.len(), 2);
 
         let opts = SweepOptions::default();
-        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
+        dedup_stale_units(&profile, &mut inv, &live, &opts).unwrap();
 
         // Both survive — different units.
         assert_eq!(inv.live_hashes.len(), 2);
@@ -819,7 +917,7 @@ mod tests {
         assert_eq!(inv.live_hashes.len(), 1);
 
         let opts = SweepOptions::default();
-        dedup_stale_units(&profile, &mut inv, &opts).unwrap();
+        dedup_stale_units(&profile, &mut inv, &live, &opts).unwrap();
 
         assert_eq!(inv.live_hashes.len(), 1);
         assert!(inv.stale_fingerprints.is_empty());

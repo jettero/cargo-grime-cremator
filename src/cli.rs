@@ -27,6 +27,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
 
+    /// Point at another project's root directory. Shorthand for
+    /// `--manifest-path <PATH>/Cargo.toml` — useful for running gc
+    /// against a sibling project without cd-ing into it.
+    #[arg(long, value_name = "PATH")]
+    pub project: Option<PathBuf>,
+
     /// Only sweep a single profile (e.g. `debug` or `release`).
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,

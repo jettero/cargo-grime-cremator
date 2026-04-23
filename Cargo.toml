@@ -29,3 +29,12 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Split opt-levels match the bevy/xp5 build pattern that triggers ThinLTO
+# zombies. Deps compile at opt-level 3 (ThinLTO → hidden-visibility symbols),
+# workspace crate compiles at opt-level 1 (no ThinLTO).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

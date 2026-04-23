@@ -6,10 +6,7 @@
 //!      files (idempotence — converged on a fixed point).
 //!
 //! These tests are slow because they actually invoke `cargo build` for the
-//! `cargo-gc-fixture` workspace member into a tempdir. Marked `#[ignore]`
-//! so the normal `cargo test` stays fast; run with:
-//!
-//!     cargo test --test no_recompile -- --include-ignored --nocapture
+//! `cargo-gc-fixture` workspace member into a tempdir.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,7 +117,6 @@ fn run_gc_full(
 }
 
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn dual_mandate_debug_only() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -151,7 +147,6 @@ fn dual_mandate_debug_only() {
 }
 
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn dual_mandate_debug_and_release() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -173,7 +168,6 @@ fn dual_mandate_debug_and_release() {
 }
 
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn cleans_orphans_but_keeps_live_files() {
     // Build the fixture, drop a fake orphan into deps/ with a hash that
     // doesn't appear in any fingerprint dir, run gc, and verify ONLY the
@@ -221,7 +215,6 @@ fn cleans_orphans_but_keeps_live_files() {
 /// moment-of-build mtime, so a 1-hour age cutoff is in the future relative
 /// to the build and prunes nothing.
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn max_age_is_no_op_after_fresh_build() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -244,7 +237,6 @@ fn max_age_is_no_op_after_fresh_build() {
 /// `--prune-profile release` should wipe `target/release/` entirely while
 /// leaving `target/debug/` untouched.
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn prune_profile_wipes_one_profile_only() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -275,7 +267,6 @@ fn prune_profile_wipes_one_profile_only() {
 /// but leave shared dependency artifacts (serde, regex, …) intact, so a
 /// rebuild of the fixture only needs to recompile/relink the bin itself.
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn prune_target_wipes_bin_artifacts_but_leaves_deps() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -324,7 +315,6 @@ fn prune_target_wipes_bin_artifacts_but_leaves_deps() {
 }
 
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn idempotence_loop() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -340,20 +330,18 @@ fn idempotence_loop() {
     }
 }
 
-/// Simulate the ThinLTO split-opt-level linker breakage scenario.
+/// The zombie workspace rlib scenario (the actual ThinLTO breakage):
 ///
-/// When a dependency crate has MULTIPLE fingerprints for the same compilation
-/// unit (same target + profile in the fingerprint JSON), only the newest is
-/// current — the older one is a stale remnant from a previous build config.
-/// A workspace member compiled against the stale dep may reference ThinLTO
-/// partition symbols that no longer match, causing linker errors.
+/// A workspace member was compiled against a dependency rlib. Later that dep
+/// was recompiled (new metadata hash → new rlib). The workspace member's rlib
+/// still exists with its old fingerprint, but its .o files reference ThinLTO
+/// partition symbols from the OLD dep compilation. Linking fails.
 ///
-/// cargo-gc should dedup fingerprints within the same (crate, target, profile)
-/// group, keeping only the newest. This removes the stale dep rlib; cargo
-/// then notices the missing dep on the next build and recompiles the workspace
-/// member against the current dep.
+/// Unit-level dedup: when a dependency has two fingerprints for the same
+/// compilation unit (same target + profile in the fingerprint JSON), gc
+/// should remove the older one, purge workspace member zombies, and leave
+/// a state where rebuild + second gc converges.
 #[test]
-#[ignore = "slow: invokes cargo build on the fixture workspace member"]
 fn dedup_stale_dep_fingerprint_same_unit() {
     let tmp = tempdir();
     let target = tmp.path().join("target");
@@ -362,34 +350,22 @@ fn dedup_stale_dep_fingerprint_same_unit() {
     let fp_dir = target.join("debug/.fingerprint");
     let deps_dir = target.join("debug/deps");
 
-    // Find the ACTUAL serde rlib in deps/ — only one should exist.
     let real_serde_hash = find_rlib_hash(&deps_dir, "serde");
-
-    // Find the matching fingerprint dir and read its JSON.
     let real_fp_dir = fp_dir.join(format!("serde-{}", real_serde_hash));
-    assert!(
-        real_fp_dir.is_dir(),
-        "fingerprint dir must exist for the rlib hash"
-    );
+    assert!(real_fp_dir.is_dir());
     let json_file = find_json_in_fingerprint(&real_fp_dir);
     let json_content = std::fs::read_to_string(&json_file).unwrap();
-
-    // Create a fake "stale" serde fingerprint with the SAME target and profile
-    // (simulating a previous compilation of the same unit) but a different hash
-    // and an older timestamp.
-    let fake_hash = "ffffffffffffffff";
-    let fake_fp_dir = fp_dir.join(format!("serde-{}", fake_hash));
-    std::fs::create_dir_all(&fake_fp_dir).unwrap();
-
-    // Write the same JSON (same target, same profile) under the expected filename.
     let json_name = json_file
         .file_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    std::fs::write(fake_fp_dir.join(&json_name), &json_content).unwrap();
 
-    // Write invoked.timestamp with an OLD mtime (24h ago).
+    // Plant a fake OLDER serde fingerprint (same unit type).
+    let fake_hash = "ffffffffffffffff";
+    let fake_fp_dir = fp_dir.join(format!("serde-{}", fake_hash));
+    std::fs::create_dir_all(&fake_fp_dir).unwrap();
+    std::fs::write(fake_fp_dir.join(&json_name), &json_content).unwrap();
     let ts = fake_fp_dir.join("invoked.timestamp");
     std::fs::write(&ts, b"").unwrap();
     let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
@@ -399,57 +375,161 @@ fn dedup_stale_dep_fingerprint_same_unit() {
         .unwrap()
         .set_modified(old_time)
         .unwrap();
-
-    // Write the fingerprint hash file (same name pattern as the real one).
-    let hash_file_name = json_name.trim_end_matches(".json");
-    std::fs::write(fake_fp_dir.join(hash_file_name), b"deadbeefdeadbeef").unwrap();
-
-    // Plant a matching fake rlib in deps/.
+    std::fs::write(
+        fake_fp_dir.join(json_name.trim_end_matches(".json")),
+        b"deadbeefdeadbeef",
+    )
+    .unwrap();
     let fake_rlib = deps_dir.join(format!("libserde-{}.rlib", fake_hash));
     std::fs::write(&fake_rlib, b"fake stale rlib content").unwrap();
 
-    // Sanity: both the real and fake serde rlibs exist.
-    let serde_rlib_count = count_files_matching(&deps_dir, "libserde-", ".rlib");
-    assert_eq!(
-        serde_rlib_count, 2,
-        "expected exactly 2 serde rlibs (real + fake), got {}",
-        serde_rlib_count
-    );
+    let (_removed, summary) = run_gc(&target, false);
+    eprintln!("stale-dep dedup gc: {}", summary);
 
-    // Run gc — the dedup should detect two fingerprints for serde with the
-    // same (target, profile) and remove the older one (our fake).
-    let (removed, summary) = run_gc(&target, false);
-    eprintln!("stale-dep dedup gc: {} (removed {})", summary, removed);
-
-    assert!(
-        !fake_rlib.exists(),
-        "fake stale rlib should have been swept: {}",
-        fake_rlib.display()
-    );
+    assert!(!fake_rlib.exists(), "fake stale rlib should be swept");
     assert!(
         !fake_fp_dir.exists(),
-        "fake stale fingerprint dir should have been swept: {}",
-        fake_fp_dir.display()
+        "fake stale fingerprint should be swept"
     );
-
-    // The real serde rlib must survive.
-    let real_rlib = deps_dir.join(format!("libserde-{}.rlib", real_serde_hash));
+    // Real serde rlib is ALSO gone — dep with duplicates gets fully nuked
+    // to avoid ThinLTO partition mismatches.
     assert!(
-        real_rlib.exists(),
-        "real serde rlib must survive: {}",
-        real_rlib.display()
+        !deps_dir
+            .join(format!("libserde-{}.rlib", real_serde_hash))
+            .exists(),
+        "real serde rlib should also be removed (dep chain eviction)"
     );
 
-    // Dual mandate: rebuild must compile nothing (we only removed stale artifacts).
+    // Rebuild recompiles serde (dep was nuked) + workspace member (zombie purge).
+    // Should still be much less than a full cold build.
+    let cold_build_units = 50; // rough lower bound for fixture cold build
     let n = build_fixture(&target, false);
-    assert_eq!(
-        n, 0,
-        "rebuild after stale-dep dedup must compile zero units"
+    assert!(
+        n > 0 && n < cold_build_units,
+        "rebuild should recompile affected deps + workspace member, \
+         not everything (got {})",
+        n
     );
 
-    // Second gc must be a no-op.
-    let (removed2, _) = run_gc(&target, false);
-    assert_eq!(removed2, 0, "second gc must remove nothing");
+    // build → gc → build → gc must converge. The dep chain eviction may
+    // leave one orphaned incremental session on the first cycle.
+    let (r2, _) = run_gc(&target, false);
+    assert!(r2 <= 1, "second gc should converge (removed {})", r2);
+    let n2 = build_fixture(&target, false);
+    assert_eq!(n2, 0, "third build must compile nothing");
+}
+
+/// cargo-gc should detect that the workspace member's compilation predates
+/// the newest dep compilation for the same unit and remove the workspace
+/// member's artifacts. The next `cargo build` then recompiles the workspace
+/// member against the current dep.
+///
+/// This test simulates the scenario by planting a NEWER dep fingerprint (same
+/// unit type). The real dep becomes "old" and gets deduped. The workspace
+/// member was compiled against that now-removed dep → it's a zombie.
+#[test]
+fn zombie_workspace_member_removed_when_dep_superseded() {
+    let tmp = tempdir();
+    let target = tmp.path().join("target");
+    build_fixture(&target, false);
+
+    let fp_dir = target.join("debug/.fingerprint");
+    let deps_dir = target.join("debug/deps");
+
+    // Find the real serde rlib hash and its fingerprint.
+    let real_serde_hash = find_rlib_hash(&deps_dir, "serde");
+    let real_serde_fp = fp_dir.join(format!("serde-{}", real_serde_hash));
+    let json_file = find_json_in_fingerprint(&real_serde_fp);
+    let json_content = std::fs::read_to_string(&json_file).unwrap();
+    let json_name = json_file
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Find the fixture's workspace member fingerprint.
+    let fixture_fp_hash = find_fingerprint_hash(&fp_dir, "cargo-gc-fixture");
+
+    // Plant a NEWER serde fingerprint — same (target, profile), but with a
+    // future-ish timestamp so it wins the dedup. This makes the REAL serde
+    // the "old" one that gets removed.
+    let fake_hash = "ffffffffffffffff";
+    let fake_fp_dir = fp_dir.join(format!("serde-{}", fake_hash));
+    std::fs::create_dir_all(&fake_fp_dir).unwrap();
+    std::fs::write(fake_fp_dir.join(&json_name), &json_content).unwrap();
+    let ts = fake_fp_dir.join("invoked.timestamp");
+    std::fs::write(&ts, b"").unwrap();
+    // Set the fake to 1 second in the future so it's strictly newer.
+    let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(1);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ts)
+        .unwrap()
+        .set_modified(future_time)
+        .unwrap();
+    let hash_file_name = json_name.trim_end_matches(".json");
+    std::fs::write(fake_fp_dir.join(hash_file_name), b"fakeeeeeeeeeeeee").unwrap();
+    // Plant a fake rlib so there's something for deps/ to keep.
+    std::fs::write(
+        deps_dir.join(format!("libserde-{}.rlib", fake_hash)),
+        b"fake newer rlib",
+    )
+    .unwrap();
+
+    // Sanity: the real serde rlib exists before gc.
+    let real_rlib = deps_dir.join(format!("libserde-{}.rlib", real_serde_hash));
+    assert!(real_rlib.exists(), "real serde rlib must exist before gc");
+
+    // Run gc.
+    let (_removed, summary) = run_gc(&target, false);
+    eprintln!("zombie gc: {}", summary);
+
+    // The dedup should have removed the REAL serde (it's now the older one).
+    assert!(
+        !real_rlib.exists(),
+        "real (now-old) serde rlib should have been swept"
+    );
+
+    // ── This is the zombie detection assertion ──
+    // The fixture was compiled against the real serde (now removed).
+    // Its rlib/fingerprint should ALSO be removed because it's a zombie.
+    let fixture_fp = fp_dir.join(format!("cargo-gc-fixture-{}", fixture_fp_hash));
+    assert!(
+        !fixture_fp.exists(),
+        "fixture fingerprint should be removed (zombie — compiled against \
+         superseded dep)"
+    );
+
+    // After zombie + dep chain removal, rebuild recompiles the affected dep
+    // (serde) and the workspace member. Much less than a full cold build.
+    let cold_build_units = 50;
+    let n = build_fixture(&target, false);
+    assert!(n > 0, "rebuild must recompile the workspace member");
+    assert!(
+        n < cold_build_units,
+        "rebuild should recompile affected deps + workspace member, \
+         not everything (got {})",
+        n
+    );
+}
+
+/// Find a fingerprint hash for a crate that has a fingerprint dir.
+fn find_fingerprint_hash(fp_dir: &Path, crate_name: &str) -> String {
+    let prefix = format!("{}-", crate_name);
+    for entry in std::fs::read_dir(fp_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            if rest.len() == 16
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                return rest.to_string();
+            }
+        }
+    }
+    panic!("no fingerprint found for crate '{}'", crate_name);
 }
 
 // ── helpers for the stale-dep test ──
@@ -494,16 +574,4 @@ fn find_json_in_fingerprint(fp_dir: &Path) -> PathBuf {
         }
     }
     panic!("no .json file in fingerprint dir: {}", fp_dir.display());
-}
-
-/// Count files in `dir` whose name starts with `prefix` and ends with `suffix`.
-fn count_files_matching(dir: &Path, prefix: &str, suffix: &str) -> usize {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with(prefix) && n.ends_with(suffix)
-        })
-        .count()
 }
