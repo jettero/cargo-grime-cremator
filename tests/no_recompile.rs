@@ -10,6 +10,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+// Serialize nested `cargo build` invocations across parallel test threads.
+// Without this, N parallel tests × N rustc workers each = process explosion
+// that survives 128 GB locally but kills small CI runners.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,6 +46,7 @@ fn tempdir() -> tempfile::TempDir {
 /// Run `cargo build -p cargo-gc-fixture` against the given target dir,
 /// returning how many units cargo reported "Compiling" for.
 fn build_fixture(target_dir: &Path, release: bool) -> usize {
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("-p")
